@@ -1,4 +1,4 @@
-use ::serenity::all::{EventHandler, GatewayIntents, Message};
+use ::serenity::all::GatewayIntents;
 use ::serenity::prelude::TypeMapKey;
 use dotenvy::dotenv;
 use err::AppError;
@@ -7,11 +7,12 @@ use poise::serenity_prelude as serenity;
 use songbird::SerenityInit;
 use std::env;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info, warn};
 
 mod apol;
 mod err;
 mod helpers;
+mod odesli;
 mod voice;
 
 struct Data {}
@@ -33,19 +34,17 @@ async fn age(
     Ok(())
 }
 
-// Event handler
-struct Handler;
-
-#[serenity::async_trait]
-impl EventHandler for Handler {
-    async fn message(&self, _ctx: serenity::prelude::Context, _msg: Message) {
-        // are we mentioned?
-        // get autorespond channels list from env
-    }
-
-    async fn ready(&self, ctx: serenity::prelude::Context, _ready: serenity::Ready) {
-        let user = ctx.cache.current_user();
-        println!("{}: We are up and running.", user.name)
+async fn on_error(error: poise::FrameworkError<'_, Arc<Data>, AppError>) {
+    match error {
+        poise::FrameworkError::Setup { error, .. } => panic!("Failed to start bot {:?}", error),
+        poise::FrameworkError::Command { error, ctx, .. } => {
+            warn!("Error in command `{}`: {:?}", ctx.command().name, error);
+        }
+        error => {
+            if let Err(e) = poise::builtins::on_error(error).await {
+                error!("Error while handling error: {}", e)
+            }
+        }
     }
 }
 
@@ -66,8 +65,32 @@ async fn main() {
                 age(),
                 voice::play::play(),
                 voice::pause::pause(),
+                voice::queue::skip(),
                 voice::queue::now_playing(),
+                voice::queue::queue(),
             ],
+            pre_command: |ctx| {
+                Box::pin(async move {
+                    info!("Executing command {}...", ctx.command().qualified_name);
+                })
+            },
+            on_error: |error| Box::pin(on_error(error)),
+
+            post_command: |ctx| {
+                Box::pin(async move {
+                    info!("Executed command {}!", ctx.command().qualified_name);
+                })
+            },
+            event_handler: |_ctx, event, _framework, _data| {
+                Box::pin(async move {
+                    info!(
+                        "Got an event in event handler: {:?}",
+                        event.snake_case_name()
+                    );
+                    Ok(())
+                })
+            },
+
             ..Default::default()
         })
         .setup(|ctx, ready, framework| {

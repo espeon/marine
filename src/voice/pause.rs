@@ -1,6 +1,4 @@
-use songbird::input::{Compose, YoutubeDl};
-
-use crate::{helpers::get_http_client, voice::metadata::Metadata, AppError, Context};
+use crate::{voice::metadata::Metadata, AppError, Context};
 
 use super::get_or_join_call;
 
@@ -19,7 +17,7 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), AppError> {
 
     let (guild_id, channel_id) = super::guild_info(ctx).await?;
 
-    if let Ok(handler_lock) = get_or_join_call(&manager, guild_id, channel_id).await {
+    if let Ok(handler_lock) = get_or_join_call(&manager, ctx, guild_id, channel_id).await {
         let handler = handler_lock.lock().await;
 
         let current = handler.queue().current();
@@ -29,17 +27,12 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), AppError> {
         }
 
         if let Some(current) = current {
-            ctx.say(format!(
-                "Paused - current track is: {:?}",
-                current
-                    .typemap()
-                    .read()
-                    .await
-                    .get::<Metadata>()
-                    .unwrap()
-                    .title
-            ))
-            .await?;
+            if let Some(metadata) = current.typemap().read().await.get::<Metadata>() {
+                ctx.say(format!("Paused - current track is: {:?}", metadata.title))
+                    .await?;
+            } else {
+                ctx.say("Paused this track.").await?;
+            }
         } else {
             ctx.say("Paused - no track playing").await?;
         }

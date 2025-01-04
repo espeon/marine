@@ -1,6 +1,14 @@
-use songbird::input::{Compose, YoutubeDl};
+use std::time::Duration;
 
-use crate::{helpers::get_http_client, AppError, Context};
+use poise::CreateReply;
+use serenity::all::CreateEmbed;
+use songbird::input::{AuxMetadata, Compose, YoutubeDl};
+use tracing::info;
+
+use crate::{
+    helpers::{d2hms, get_http_client, trim_artist_from_title},
+    AppError, Context,
+};
 
 use super::{get_or_join_call, metadata::Metadata};
 
@@ -18,8 +26,7 @@ pub async fn play(
     if let Some(song) = song {
         play_inner(ctx, song).await
     } else {
-        ctx.say("No song provided").await?;
-        Ok(())
+        resume(ctx).await
     }
 }
 
@@ -31,7 +38,7 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), AppError> {
 
     let (guild_id, channel_id) = super::guild_info(ctx).await?;
 
-    if let Ok(handler_lock) = get_or_join_call(&manager, guild_id, channel_id).await {
+    if let Ok(handler_lock) = get_or_join_call(&manager, ctx, guild_id, channel_id).await {
         let handler = handler_lock.lock().await;
 
         let current = handler.queue().current();
@@ -41,17 +48,16 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), AppError> {
         }
 
         if let Some(current) = current {
-            ctx.say(format!(
-                "Unpaused - {:?}",
-                current
-                    .typemap()
-                    .read()
-                    .await
-                    .get::<Metadata>()
-                    .unwrap()
-                    .title
-            ))
-            .await?;
+            if let Some(metadata) = current.typemap().read().await.get::<Metadata>() {
+                ctx.say(format!(
+                    "Unpaused - {}",
+                    trim_artist_from_title(
+                        &metadata.title.clone().unwrap_or("None".to_string()),
+                        &metadata.artist.clone().unwrap_or("MY CLOCK".to_string())
+                    )
+                ))
+                .await?;
+            }
         } else {
             ctx.say("Resumed!").await?;
         }
@@ -80,7 +86,9 @@ pub async fn play_inner(ctx: Context<'_>, song: String) -> Result<(), AppError> 
 
     let channel_id = ctx.channel_id();
 
-    if let Ok(handler_lock) = get_or_join_call(&manager, guild_id, channel_id).await {
+    if let Ok(handler_lock) = get_or_join_call(&manager, ctx, guild_id, channel_id).await {
+        // give us more time to load the track!
+        ctx.defer().await?;
         let mut handler = handler_lock.lock().await;
 
         let http = get_http_client(ctx.serenity_context()).await;
@@ -90,18 +98,85 @@ pub async fn play_inner(ctx: Context<'_>, song: String) -> Result<(), AppError> 
 
         let metadata = src.aux_metadata().await;
 
-        let h = handler.enqueue_input(src.into()).await;
-
         if let Ok(metadata) = metadata {
-            ctx.say(format!("Playing - {:?}", metadata.title)).await?;
-            h.typemap().write().await.insert::<Metadata>(metadata);
+            info!("Got metadata: {:?}", metadata);
+
+            let embed = build_play_embed(&metadata, false, None).await;
+
+            let mut title = metadata.title.clone().unwrap_or("This track".to_string());
+
+            if title != "This track" {
+                title = trim_artist_from_title(
+                    &title,
+                    &metadata.artist.clone().unwrap_or("MY CLOCK".to_string()),
+                );
+            }
+
+            // build reply message
+            let queue = handler.queue();
+            let content = match queue.len() {
+                0 => format!("{title} is now playing."),
+                1 => format!("{title} is up next."),
+                2 => format!("{title} will play after this next track."),
+                _ => format!(
+                    "{title} will play after the next {} tracks.",
+                    queue.len() - 1
+                ),
+            };
+
+            let reply = CreateReply::default().content(content).embed(embed);
+
+            ctx.send(reply).await?;
+            let h = handler.enqueue_input(src.into()).await;
+            h.typemap()
+                .write()
+                .await
+                .insert::<Metadata>(metadata.clone());
         } else {
+            info!("Failed to get metadata or no metadata available");
             ctx.say("Failed to get metadata, but playing anyways")
                 .await?;
+            handler.enqueue_input(src.into()).await;
         }
     } else {
         ctx.say("Not in a voice channel to play in").await?;
     }
 
     Ok(())
+}
+
+pub async fn build_play_embed(
+    metadata: &AuxMetadata,
+    title: bool,
+    progress: Option<Duration>,
+) -> CreateEmbed {
+    let mut embed = CreateEmbed::default();
+    let mut desc = String::new();
+    if title {
+        if let Some(title) = metadata.title.clone() {
+            embed = embed.title(title);
+        }
+    }
+    if let Some(thumbnail) = metadata.thumbnail.clone() {
+        embed = embed.image(thumbnail);
+    }
+    if let Some(duration) = metadata.duration {
+        if let Some(progress) = progress {
+            desc.push_str(&format!("{} / ", d2hms(progress)));
+        }
+        desc.push_str(&format!("{}\n", d2hms(duration)));
+    }
+    if let Some(source_url) = metadata.source_url.clone() {
+        embed = embed.url(source_url);
+    }
+    if let Some(artist) = metadata.artist.clone() {
+        desc.push_str(&format!("Artist: {}\n", artist));
+    }
+    if let Some(album) = metadata.album.clone() {
+        desc.push_str(&format!("Album: {}\n", album));
+    }
+    if !desc.is_empty() {
+        embed = embed.description(desc);
+    }
+    embed
 }
